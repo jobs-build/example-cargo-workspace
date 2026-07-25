@@ -1,0 +1,7 @@
+[workspace]
+members = ["crates/app", "crates/greeting", "crates/unused"]
+resolver = "2"
+
+[workspace.dependencies]
+# Used by crates/unused ONLY — app's pruned Cargo.lock demonstrably drops it.
+heck = "0.5"

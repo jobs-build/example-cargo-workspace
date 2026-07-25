@@ -1,0 +1,146 @@
+# BUILD.jobs — build one member of a cargo workspace with JOBS (sibling sources).
+#
+# plugins(): declares the "cargo" build plugin. Called with workspace = True it
+#            switches from lockfile-kwarg parsing to WORKSPACE mode (sibling-
+#            sources design §12.2): it reads the mounted monorepo context
+#            itself, walks this crate's path-dep closure, and answers
+#            {crates, sources, generated}.
+# build():   forwards resp["sources"] (here ["//crates/greeting"]) into
+#            sources= and resp["generated"] (the REDUCED root Cargo.toml — the
+#            [workspace] members list shrunk to the closure — plus the PRUNED
+#            root Cargo.lock — only the closure's [[package]] entries) into
+#            generated=. The covered tree materializes at $SRC_ROOT with the
+#            generated files overlaid at the workspace root, so
+#            `path = "../greeting"` and the workspace lookup just work, while
+#            crates/unused and its external dep (heck) never enter the build's
+#            identity. resp["crates"] is the usual crates.io import list —
+#            computed from the PRUNED lock, so only the closure's registry
+#            deps are fetched (none, for app). The rest is the standard
+#            offline, C-toolchain-free musl Rust build from the rust-build
+#            example (vendored registry, rust-lld, loader from hostmusl).
+
+# Recipe-declared fetchers (JOBS 2026-07-10 design): the plugin build is
+# pinned here; plugin artifacts bundle their companion fetcher pins.
+CARGOPLUGIN = fetcher(
+    name   = "cargoplugin",
+    url    = "https://github.com/jobs-build/plugin-cargo/archive/d9ca353e340834f179b9a7b01c2d329bdb9c5d6b.tar.gz",
+    sha256 = "d9646ffbce2aabd3cd55c98233355955fcfa193993f19e27f9ff7962a13575a2",
+)
+
+def plugins():
+    return {"cargo": imp(fetcher = CARGOPLUGIN, params = {})}
+
+def build():
+    # Map the JOBS platform to the musl/rust arch token. Every "x86_64" in the
+    # script below (target triple, ld-musl loader, rust-std/rustlib dirs) is
+    # this same token, so a single .replace() at the end retargets the whole
+    # script; only the toolchain URL + sha256 are selected per-arch.
+    arch = {"linux/amd64": "x86_64", "linux/arm64": "aarch64"}[platform]
+    rust_sha = {
+        "x86_64": "545aff63f37dea2fcbd8037b877219fca6fbba97660bdcb8d3a0fc5df5fa9edf",
+        "aarch64": "f55a1f02736d9bcd38969a30f2e6bde8184fd36f13e94f773cac068a56407f16",
+    }
+    toolchain = imp(fetcher = "tarball+https", params = {
+        "url": "https://static.rust-lang.org/dist/rust-1.96.0-" + arch + "-unknown-linux-musl.tar.gz",
+        "sha256": rust_sha[arch],
+    })
+    musl = imp(fetcher = "hostmusl", params = {}, platform = platform)
+
+    # Workspace mode: the plugin reads the mounted context (this crate's dir
+    # rides in the request), so no source.read() kwargs are needed — and none
+    # would reach above this dir anyway, which is the point of the mode.
+    resp = plugins["cargo"](workspace = True)
+
+    inputs = {"toolchain": toolchain, "musl": musl}
+    copies = []
+    for i, c in enumerate(resp["crates"]):
+        name = "crate_%d" % i
+        inputs[name] = c["input"]
+        copies.append('cp -dr "$(jq -r .%s <<<"$JOBS_DEPS")/." /build/vendor/' % name)
+
+    script = ("""
+musl="$(jq -r .musl <<<"$JOBS_DEPS")"
+toolchain="$(jq -r .toolchain <<<"$JOBS_DEPS")"
+
+# 1. musl loader + libgcc_s for the PREBUILT toolchain (its PT_INTERP is
+#    /lib/ld-musl-x86_64.so.1; rustc/cargo also NEED-link libgcc_s.so.1). LD_LIBRARY_PATH
+#    lets the toolchain, the proc-macro .so files (dlopened by rustc at compile time), and
+#    build-script binaries find both libs from the hostmusl artifact.
+mkdir -p /lib
+ln -sf "$musl/lib/ld-musl-x86_64.so.1" /lib/ld-musl-x86_64.so.1
+ln -sf "$musl/lib/libgcc_s.so.1" /lib/libgcc_s.so.1
+export LD_LIBRARY_PATH="$musl/lib"
+
+# 2. Stage the toolchain into the writable /build tree (sequential cp avoids the
+#    FUSE store's concurrent-read EIO; the combined installer's top dir is
+#    versioned, so */ matches it). install.sh is never run.
+mkdir -p /build/rust "$out/bin"
+cp -dr "$toolchain"/*/rustc/. /build/rust/
+cp -dr "$toolchain"/*/cargo/. /build/rust/
+cp -dr "$toolchain"/*/rust-std-x86_64-unknown-linux-musl/. /build/rust/
+chmod -R u+w /build/rust
+export PATH="/build/rust/bin:$PATH"
+export CARGO_HOME=/build/cargo
+
+# 3. Vendor every registry crate the PRUNED lock still names (each input
+#    rooted at <name>-<version>/). For app that is zero crates — heck is only
+#    reachable from crates/unused, and the pruned lock dropped it.
+mkdir -p /build/vendor
+""" + "\n".join(copies) + """
+
+# 4. Offline config at the WORKSPACE root (config discovery walks up from
+#    CWD, so the whole workspace sees it): source replacement + dynamic musl
+#    linked by Rust's BUNDLED rust-lld (no GCC). rust-lld is invoked directly,
+#    so the link-args are BARE (no -Wl, cc-driver prefix). -L native=$musl/lib
+#    + link-self-contained resolve -lc/-lgcc_s (via the hostmusl symlinks +
+#    the toolchain's self-contained crt); --dynamic-linker + -rpath point the
+#    output's interpreter/RUNPATH into the content-addressed store (mounted
+#    by jobs run/image).
+RUSTLLD="/build/rust/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld"
+mkdir -p "$SRC_ROOT/.cargo"
+cat > "$SRC_ROOT/.cargo/config.toml" <<EOF
+[source.crates-io]
+replace-with = "vendored-sources"
+[source.vendored-sources]
+directory = "/build/vendor"
+[target.x86_64-unknown-linux-musl]
+linker = "$RUSTLLD"
+[build]
+rustflags = ["-C", "target-feature=-crt-static", "-C", "link-self-contained=yes", "-L", "native=$musl/lib", "-C", "link-arg=--dynamic-linker=$musl/lib/ld-musl-x86_64.so.1", "-C", "link-arg=-rpath", "-C", "link-arg=$musl/lib"]
+EOF
+
+# 5. Build offline from the crate dir (CWD is already $SRC =
+#    $SRC_ROOT/crates/app; cargo walks up and finds the REDUCED workspace
+#    root + PRUNED lock at $SRC_ROOT). --frozen = --locked --offline, so the
+#    pruned lock must exactly match the reduced workspace's resolution — that
+#    is the coherence the generated pair guarantees. CARGO_TARGET_DIR points
+#    into the declared build cache, so compiled dependency crates +
+#    fingerprints persist across builds.
+export CARGO_TARGET_DIR=/cargo-target-cache
+cd "$SRC"
+cargo build --release --frozen
+cp "$CARGO_TARGET_DIR/release/app" "$out/bin/app"
+cat > "$out/JOBS.entrypoint" <<'EOF'
+{"command": "bin/app", "args": [], "env": {}}
+EOF
+""").replace("x86_64", arch)
+
+    return struct(
+        name = "example-cargo-workspace app",
+        inputs = inputs,
+        env = {},
+        script = script,
+        runtime_deps = [musl],
+        # The covered closure: the plugin-discovered path-dep siblings. With
+        # the dir seed (crates/app) this is EXACTLY what the build is keyed on
+        # (KP) — edits anywhere else in the repo memo-hit.
+        sources = resp["sources"],
+        # Plugin-synthesized files overlaid on the covered tree at pin time:
+        # the reduced root Cargo.toml + pruned root Cargo.lock. Unrelated
+        # workspace churn (a bump of unused's deps) leaves these bytes
+        # identical -> same KP -> memo hit.
+        generated = resp["generated"],
+        # Persistent cargo target dir (compiled dependency crates), keyed to
+        # the toolchain release; platform is auto-appended by the runner.
+        caches = {"/cargo-target-cache": "example-cargo-workspace-rust1.96.0"},
+    )
