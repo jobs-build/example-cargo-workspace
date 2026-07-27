@@ -1,5 +1,9 @@
 # `example-cargo-workspace` — sibling sources in a cargo workspace
 
+<p align="center">
+  <img src="docs/assets/jobs-logo.jpg" alt="JOBS — Jonas' Own Build System" width="520">
+</p>
+
 A worked example of **sibling sources** (JOBS sibling-sources design,
 2026-07-26) for Rust: a `BUILD.jobs` in a workspace member whose crate depends
 on a **sibling crate** through a plain cargo `path = "../greeting"` dependency
