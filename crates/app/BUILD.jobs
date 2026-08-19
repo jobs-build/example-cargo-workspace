@@ -23,8 +23,8 @@
 # pinned here; plugin artifacts bundle their companion fetcher pins.
 CARGOPLUGIN = fetcher(
     name   = "cargoplugin",
-    url    = "https://github.com/jobs-build/plugin-cargo/archive/d9ca353e340834f179b9a7b01c2d329bdb9c5d6b.tar.gz",
-    sha256 = "d9646ffbce2aabd3cd55c98233355955fcfa193993f19e27f9ff7962a13575a2",
+    url    = "https://github.com/jobs-build/plugin-cargo/archive/refs/tags/v0.1.0.tar.gz",
+    sha256 = "1f93fc9319613a677133e6b6f13948cd3c7a8e11c60f59770d893315eddf0818",
 )
 
 def plugins():
